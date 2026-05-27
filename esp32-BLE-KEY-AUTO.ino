@@ -10,22 +10,22 @@
   #define LOG(x)
 #endif
 
-// ============== 引脚定义 ==============
-#define PIN_BTN_PREV   8  // 上一曲按钮
-#define PIN_BTN_NEXT   9   // 下一曲按钮（BOOT）
-#define PIN_LED        0  // 状态指示灯
+// ============== 引脚定义（针对 ESP32-C3 进行了安全调整） ==============
+#define PIN_BTN_PREV   8 // 上一曲按钮（避开 9 号 BOOT 脚）
+#define PIN_BTN_NEXT   9  // 下一曲按钮（避开 9 号 BOOT 脚）
+#define PIN_LED        1  // 状态指示灯（避开 0, 1 等特殊脚）
 
 // ============== 时间常量（ms） ==============
 #define DEBOUNCE_MS        50
 #define LONG_PRESS_MS      2000
-#define MEDIA_KEY_HOLD_MS  50    // iOS 需要至少 50ms 才能识别媒体键
+#define MEDIA_KEY_HOLD_MS  80    // 适当延长到 80ms，iOS 识别更稳定
 #define SLOW_BLINK_MS      1000  // 已断开：慢闪
 #define FAST_BLINK_MS      200   // 配对中：快闪
 #define PAIRING_TIMEOUT_MS 30000 // 配对超时后转为等待重连
 
-// ============== BLE 键盘 ==============
-// VID/PID 伪装为罗技设备，避免 iOS 使用私有 Apple 协议解析导致媒体键失效
-BleKeyboard bleKeyboard("ESP32 MediaKey", "ESP32", 100);
+// ============== BLE 键盘初始化 ==============
+// 只传 3 个标准参数，防止部分版本的库在构造时崩溃
+BleKeyboard bleKeyboard("CarMediaKey", "Logitech", 100);
 Preferences preferences;
 
 // ============== 状态枚举 ==============
@@ -51,9 +51,14 @@ Button btnPrev  = { PIN_BTN_PREV, HIGH, HIGH, 0, 0, false, false };
 Button btnNext  = { PIN_BTN_NEXT, HIGH, HIGH, 0, 0, false, false };
 
 // ============== LED / 状态变量 ==============
-unsigned long lastBlinkTime  = 0;
+unsigned long lastBlinkTime    = 0;
 unsigned long pairingStartTime = 0;
 bool ledOn = false;
+
+// ============== 媒体键发送状态（非阻塞） ==============
+MediaKeyReport pendingKey; // 直接使用库自带的类型
+unsigned long keyPressTime   = 0;
+bool          keyPending     = false;
 
 // ============== 函数声明 ==============
 void updateButton(Button &btn);
@@ -68,6 +73,7 @@ void setup() {
 #ifdef DEBUG
   Serial.begin(115200);
 #endif
+  delay(1000); // 给串口和硬件一点稳压准备时间
   LOG("ESP32 BLE Media Keyboard Starting...");
 
   pinMode(PIN_BTN_PREV, INPUT_PULLUP);
@@ -75,7 +81,7 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, LOW);
 
-  // 只读模式打开 Preferences，读完立即关闭
+  // 只读模式打开 Preferences
   preferences.begin("ble_media", true);
   bool hasBonded = preferences.getBool("bonded", false);
   preferences.end();
@@ -88,15 +94,26 @@ void setup() {
     setState(STATE_PAIRING);
   }
 
-  bleKeyboard.set_vendor_id(0x046D);  // 罗技 VID
-  bleKeyboard.set_product_id(0xB30B);
+  // 必须先 begin，让蓝牙堆栈跑起来
   bleKeyboard.begin();
+  
+  // 随后注入 VID 和 PID 伪装
+  bleKeyboard.set_vendor_id(0x046D);  // 罗技 VID
+  bleKeyboard.set_product_id(0xB30B); // 罗技 PID
+  
   LOG("BLE Keyboard started.");
 }
 
 void loop() {
   updateButton(btnPrev);
   updateButton(btnNext);
+
+  // 媒体键非阻塞释放
+  if (keyPending && millis() - keyPressTime >= MEDIA_KEY_HOLD_MS) {
+    bleKeyboard.release(pendingKey);
+    keyPending = false;
+    LOG("<< Key Released");
+  }
 
   bool connected = bleKeyboard.isConnected();
 
@@ -111,6 +128,7 @@ void loop() {
     LOG("Device disconnected, waiting for reconnect...");
   } else if (!connected && currentState == STATE_PAIRING) {
     if (millis() - pairingStartTime > PAIRING_TIMEOUT_MS) {
+      LOG("Pairing timeout, switched to disconnected state.");
       setState(STATE_DISCONNECTED);
     }
   }
@@ -120,6 +138,8 @@ void loop() {
     if (connected) {
       LOG(">> Previous Track");
       sendMediaKey(KEY_MEDIA_PREVIOUS_TRACK);
+    } else {
+      LOG("Warning: Not connected, key ignored.");
     }
   }
 
@@ -128,6 +148,8 @@ void loop() {
     if (connected) {
       LOG(">> Next Track");
       sendMediaKey(KEY_MEDIA_NEXT_TRACK);
+    } else {
+      LOG("Warning: Not connected, key ignored.");
     }
   }
 
@@ -144,7 +166,6 @@ void loop() {
 
 // --------------------------------------------------------------------------
 
-// 集中管理状态切换，自动维护 pairingStartTime
 void setState(BleState newState) {
   currentState = newState;
   if (newState == STATE_PAIRING) {
@@ -152,11 +173,17 @@ void setState(BleState newState) {
   }
 }
 
-// 发送媒体键：press + hold + release，确保 iOS 能识别
+// 发送媒体键
 void sendMediaKey(const MediaKeyReport key) {
-  bleKeyboard.press((uint8_t*)key);
-  delay(MEDIA_KEY_HOLD_MS);
-  bleKeyboard.release((uint8_t*)key);
+  if (keyPending) {
+    bleKeyboard.release(pendingKey);
+  }
+  pendingKey[0] = key[0];
+  pendingKey[1] = key[1];
+  
+  bleKeyboard.press(pendingKey);
+  keyPressTime = millis();
+  keyPending   = true;
 }
 
 void updateButton(Button &btn) {
@@ -201,7 +228,6 @@ void handleLED() {
       }
       break;
     case STATE_CONNECTED:
-      // 仅在首次进入已连接状态时熄灭 LED，后续不重复写
       if (ledOn) {
         ledOn = false;
         digitalWrite(PIN_LED, LOW);
@@ -215,6 +241,7 @@ void clearBondingData() {
   preferences.clear();
   preferences.end();
   LOG("Bonding data cleared. Restarting...");
-  delay(500);
+  digitalWrite(PIN_LED, HIGH); // 亮灯提示正在重启
+  delay(800);
   ESP.restart();
 }
